@@ -1,0 +1,11 @@
+asyncio
+aiofiles
+pydantic>=2.0.0
+sqlite3-async
+prometheus-client
+pyyaml
+psutil
+watchdog
+tenacity
+click
+structlog
