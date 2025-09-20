@@ -14,6 +14,7 @@ class TaskState(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     NEEDS_HUMAN_REVIEW = "needs_human_review"
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
 
 
 class ProcessState(str, Enum):
@@ -60,6 +61,11 @@ class Task(BaseModel):
     working_dir: Optional[str] = None
     environment: Dict[str, str] = Field(default_factory=dict)
     
+    # Automation settings
+    auto_execute: bool = False
+    confirmation_strategy: str = "ask"  # ask, auto_yes, auto_no
+    interaction_timeout: int = 300  # seconds to wait for confirmation
+    
     # Recovery information
     retry_count: int = 0
     max_retries: int = 5
@@ -85,13 +91,13 @@ class Task(BaseModel):
 
     def to_json_file(self, file_path: str):
         """Save task to JSON file"""
-        with open(file_path, 'w') as f:
-            json.dump(self.model_dump(mode='json'), f, indent=2, default=str)
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(self.model_dump(mode='json'), f, indent=2, default=str, ensure_ascii=False)
     
     @classmethod
     def from_json_file(cls, file_path: str) -> 'Task':
         """Load task from JSON file"""
-        with open(file_path, 'r') as f:
+        with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         return cls(**data)
 
@@ -109,6 +115,18 @@ class Task(BaseModel):
         return self.retry_count < self.max_retries and self.task_state not in [
             TaskState.COMPLETED, TaskState.NEEDS_HUMAN_REVIEW
         ]
+    
+    def should_auto_confirm(self) -> bool:
+        """Check if task should automatically confirm prompts"""
+        return self.auto_execute or self.confirmation_strategy == "auto_yes"
+    
+    def get_confirmation_response(self, prompt: str = "") -> Optional[str]:
+        """Get appropriate response for confirmation prompt"""
+        if self.confirmation_strategy == "auto_yes":
+            return "yes"
+        elif self.confirmation_strategy == "auto_no":
+            return "no"
+        return None  # requires user input
 
 
 class WorkerStatus(BaseModel):

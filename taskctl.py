@@ -18,6 +18,7 @@ from config.config import config
 from utils import setup_logging, format_duration
 from security import security_manager
 from monitoring import MonitoringService
+from command_generator import command_generator
 
 
 @click.group()
@@ -47,11 +48,10 @@ def task():
 
 @task.command()
 @click.argument('name')
-@click.argument('command')
-@click.option('--description', '-d', help='Task description')
+@click.option('--description', '-d', required=True, help='Task description - what you want Claude to do')
 @click.option('--type', 'task_type', 
               type=click.Choice(['lightweight', 'medium_context', 'heavy_context']),
-              default='lightweight', help='Task type')
+              default='heavy_context', help='Task type')
 @click.option('--priority', '-p',
               type=click.Choice(['low', 'normal', 'high', 'urgent']),
               default='normal', help='Task priority')
@@ -59,10 +59,12 @@ def task():
 @click.option('--env', multiple=True, help='Environment variables (KEY=VALUE)')
 @click.option('--tag', multiple=True, help='Tags for task')
 @click.option('--skip-security-scan', is_flag=True, help='Skip security scan')
-def create(name, command, description, task_type, priority, working_dir, env, tag, skip_security_scan):
+def create(name, description, task_type, priority, working_dir, env, tag, skip_security_scan):
     """Create a new task"""
     try:
+        click.echo("Creating task manager...")
         task_manager = TaskManager()
+        click.echo("Task manager created successfully")
         
         # Parse environment variables
         environment = {}
@@ -73,15 +75,36 @@ def create(name, command, description, task_type, priority, working_dir, env, ta
             else:
                 click.echo(f"Warning: Ignoring invalid environment variable: {env_var}")
         
+        # Generate Claude command from description
+        click.echo(f"Generating Claude command for task: {name}")
+        generated_command = command_generator.generate_command(
+            name=name,
+            description=description,
+            task_type=TaskType(task_type),
+            working_dir=working_dir,
+            auto_execute=True
+        )
+        
+        # Validate generated command
+        if not command_generator.validate_command(generated_command):
+            click.echo("❌ Generated command failed validation. Please check your task description.")
+            return
+        
+        # Show generated command to user
+        click.echo(f"Generated command: {generated_command}")
+        
         # Create task
+        click.echo("Creating task...")
+        # Fix tag list conversion issue
+        tag_list = [] if not tag else list(tag)
         task = task_manager.create_task(
             name=name,
-            command=command,
+            command=generated_command,
             description=description,
             task_type=TaskType(task_type),
             working_dir=working_dir,
             environment=environment,
-            tags=list(tag)
+            tags=tag_list
         )
         
         # Security scan
@@ -100,14 +123,25 @@ def create(name, command, description, task_type, priority, working_dir, env, ta
                 for violation in scan_results['violations']:
                     click.echo(f"  - {violation['type']}: {violation.get('description', 'N/A')}")
         
+        # Get permission level info based on task type
+        permission_info = {
+            "lightweight": "只读权限 (Read, Grep, Glob)",
+            "medium_context": "读写权限 (Read, Write, Edit, Git)",
+            "heavy_context": "完全权限 (Read, Write, Edit, Bash, WebFetch)"
+        }
+        
         click.echo(f"✅ Task created: {task.id}")
         click.echo(f"   Name: {task.name}")
         click.echo(f"   Command: {task.command}")
         click.echo(f"   Priority: {task.priority.value}")
-        click.echo(f"   Type: {task.task_type.value}")
+        click.echo(f"   Type: {task.task_type.value} ({permission_info.get(task.task_type.value, 'Unknown')})")
+        return
         
     except Exception as e:
         click.echo(f"❌ Error creating task: {e}", err=True)
+        import traceback
+        click.echo("Full traceback:")
+        click.echo(traceback.format_exc())
         sys.exit(1)
 
 
@@ -151,12 +185,12 @@ def list(state, priority, tag, limit, output_format):
                 click.echo("No tasks found.")
                 return
             
-            click.echo(f"{'ID':<12} {'Name':<20} {'State':<15} {'Priority':<8} {'Created':<12}")
-            click.echo("-" * 75)
+            click.echo(f"{'ID':<15} {'Name':<20} {'State':<15} {'Priority':<8} {'Created':<12}")
+            click.echo("-" * 78)
             
             for task in tasks:
                 created_str = task.created_at.strftime('%Y-%m-%d')
-                click.echo(f"{task.id[:12]:<12} {task.name[:20]:<20} {task.task_state.value:<15} {task.priority.value:<8} {created_str:<12}")
+                click.echo(f"{task.id:<15} {task.name[:20]:<20} {task.task_state.value:<15} {task.priority.value:<8} {created_str:<12}")
         
     except Exception as e:
         click.echo(f"❌ Error listing tasks: {e}", err=True)
@@ -250,6 +284,70 @@ def cancel(task_id):
         
     except Exception as e:
         click.echo(f"❌ Error cancelling task: {e}", err=True)
+        sys.exit(1)
+
+
+@task.command()
+@click.argument('task_id')
+def reset(task_id):
+    """Reset a retrying/stuck task back to pending state"""
+    try:
+        task = db.get_task(task_id)
+        if not task:
+            click.echo(f"❌ Task {task_id} not found")
+            sys.exit(1)
+        
+        if task.task_state not in [TaskState.RETRYING, TaskState.PROCESSING, TaskState.WAITING_UNBAN]:
+            click.echo(f"❌ Can only reset retrying/processing/waiting_unban tasks, not {task.task_state.value}")
+            sys.exit(1)
+        
+        task_manager = TaskManager()
+        # Reset retry count and move back to pending
+        task.retry_count = 0
+        task.next_allowed_at = None
+        task_manager.update_task_state(task, TaskState.PENDING, "Reset by user")
+        
+        click.echo(f"✅ Task {task_id} reset to pending state")
+        
+    except Exception as e:
+        click.echo(f"❌ Error resetting task: {e}", err=True)
+        sys.exit(1)
+
+
+@task.command()
+@click.option('--dry-run', is_flag=True, help='Show what would be reset without actually doing it')
+def reset_all_retrying(dry_run):
+    """Reset all retrying tasks back to pending state"""
+    try:
+        retrying_tasks = db.get_tasks_by_state([TaskState.RETRYING.value])
+        
+        if not retrying_tasks:
+            click.echo("No retrying tasks found.")
+            return
+        
+        if dry_run:
+            click.echo("Would reset the following tasks:")
+            for task in retrying_tasks:
+                click.echo(f"  - {task.id} ({task.name}) - retry count: {task.retry_count}")
+            return
+        
+        task_manager = TaskManager()
+        reset_count = 0
+        
+        for task in retrying_tasks:
+            try:
+                task.retry_count = 0
+                task.next_allowed_at = None
+                task_manager.update_task_state(task, TaskState.PENDING, "Reset by batch command")
+                reset_count += 1
+                click.echo(f"✅ Reset {task.id} ({task.name})")
+            except Exception as e:
+                click.echo(f"❌ Failed to reset {task.id}: {e}")
+        
+        click.echo(f"✅ Reset {reset_count} tasks to pending state")
+        
+    except Exception as e:
+        click.echo(f"❌ Error resetting tasks: {e}", err=True)
         sys.exit(1)
 
 

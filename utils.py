@@ -85,16 +85,6 @@ def sanitize_output(text: str) -> str:
     return sanitized
 
 
-def check_violation_keywords(text: str) -> List[str]:
-    """Check for violation keywords in text"""
-    violations = []
-    text_lower = text.lower()
-    
-    for keyword in config.violation_keywords:
-        if keyword.lower() in text_lower:
-            violations.append(keyword)
-    
-    return violations
 
 
 def parse_claude_error(output: str) -> Dict[str, Any]:

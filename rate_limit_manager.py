@@ -57,8 +57,7 @@ class ClaudeProber:
         try:
             # Use a minimal Claude command to test availability
             probe_command = [
-                "claude", "code", "--no-interactive", "--query", 
-                "echo 'probe test' | head -1"
+                "claude", "-p", "echo 'probe test' | head -1"
             ]
             
             proc = await asyncio.create_subprocess_exec(

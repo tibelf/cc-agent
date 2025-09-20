@@ -70,6 +70,36 @@ class TestModels:
         task.retry_count = 1
         task.task_state = TaskState.COMPLETED
         assert task.can_retry() == False
+    
+    def test_auto_confirmation_settings(self):
+        """Test auto-confirmation related methods"""
+        task = Task(
+            id="test_auto", 
+            name="Auto Test", 
+            command="echo test"
+        )
+        
+        # Default behavior - no auto confirmation
+        assert task.should_auto_confirm() == False
+        assert task.get_confirmation_response() is None
+        
+        # Enable auto execution
+        task.auto_execute = True
+        assert task.should_auto_confirm() == True
+        assert task.get_confirmation_response() is None  # auto_execute uses default "yes"
+        
+        # Set confirmation strategy
+        task.auto_execute = False
+        task.confirmation_strategy = "auto_yes"
+        assert task.should_auto_confirm() == True
+        assert task.get_confirmation_response() == "yes"
+        
+        task.confirmation_strategy = "auto_no"
+        assert task.get_confirmation_response() == "no"
+        
+        task.confirmation_strategy = "ask"
+        assert task.should_auto_confirm() == False
+        assert task.get_confirmation_response() is None
 
 
 class TestDatabase:
@@ -344,6 +374,123 @@ class TestTaskManager:
 
 
 @pytest.mark.asyncio
+class TestAutoConfirmation:
+    """Test auto-confirmation functionality"""
+    
+    def test_command_generator_auto_execution(self):
+        """Test command generation with auto-execution"""
+        from command_generator import CommandGenerator
+        
+        generator = CommandGenerator()
+        
+        # Generate regular command
+        regular_cmd = generator.generate_command(
+            name="test task",
+            description="test description",
+            auto_execute=False
+        )
+        assert "IMPORTANT: This is an automated task execution" not in regular_cmd
+        
+        # Generate auto-execute command
+        auto_cmd = generator.generate_command(
+            name="test task", 
+            description="test description",
+            auto_execute=True
+        )
+        assert "IMPORTANT: This is an automated task execution" in auto_cmd
+        assert "Do not ask for confirmation" in auto_cmd
+    
+    def test_confirmation_prompt_detection(self):
+        """Test confirmation prompt pattern matching"""
+        from worker import ClaudeWorker
+        
+        worker = ClaudeWorker("test_worker")
+        
+        # Create test task with auto-confirmation enabled
+        task = Task(
+            id="test_auto_confirm",
+            name="Test",
+            command="echo test",
+            auto_execute=True,
+            confirmation_strategy="auto_yes"
+        )
+        
+        # Test various confirmation prompt patterns
+        test_prompts = [
+            "Would you like me to help you post these to Twitter using automation tools?",
+            "Do you prefer to copy-paste them manually?",
+            "Should I proceed with the upload?",
+            "Continue? (y/n)",
+            "Proceed [Y/n]?",
+            "Would you like to confirm this action?",
+            "Shall I execute the command?"
+        ]
+        
+        for prompt in test_prompts:
+            response = worker._handle_confirmation_prompt(task, prompt)
+            assert response == "yes", f"Failed to detect confirmation prompt: {prompt}"
+        
+        # Test non-confirmation text
+        non_prompts = [
+            "This is just regular output text",
+            "Processing your request...",
+            "The result is 42",
+            "Error: Something went wrong"
+        ]
+        
+        for text in non_prompts:
+            response = worker._handle_confirmation_prompt(task, text)
+            assert response is None, f"False positive on: {text}"
+    
+    def test_task_manager_auto_retry_setup(self):
+        """Test task manager auto-retry setup for confirmation failures"""
+        import tempfile
+        from pathlib import Path
+        
+        # Create temporary directories for testing
+        temp_dir = tempfile.mkdtemp()
+        
+        # Mock config
+        import config.config as config_module
+        original_config = config_module.config
+        
+        class MockConfig:
+            def __init__(self):
+                self.tasks_dir = Path(temp_dir) / "tasks"
+                self.tasks_dir.mkdir(parents=True, exist_ok=True)
+        
+        config_module.config = MockConfig()
+        
+        try:
+            task_manager = TaskManager()
+            
+            # Create task that needs confirmation
+            task = Task(
+                id="test_retry",
+                name="Test Retry",
+                description="test description", 
+                command="echo test",
+                auto_execute=False,
+                confirmation_strategy="ask",
+                retry_count=0
+            )
+            
+            # Simulate setting up auto-confirmation retry
+            task_manager._setup_auto_confirmation_retry(task)
+            
+            # Verify task was configured for auto-retry
+            assert task.auto_execute == True
+            assert task.confirmation_strategy == "auto_yes"
+            assert task.task_state == TaskState.PENDING
+            assert task.retry_count == 1
+            assert "IMPORTANT: This is an automated task execution" in task.command
+            
+        finally:
+            # Cleanup
+            config_module.config = original_config
+            shutil.rmtree(temp_dir)
+
+
 class TestAsyncComponents:
     """Test async components"""
     

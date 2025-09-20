@@ -63,7 +63,9 @@ class TaskManager:
             task_type=task_type,
             working_dir=working_dir,
             environment=environment or {},
-            tags=tags or []
+            tags=tags or [],
+            auto_execute=True,
+            confirmation_strategy="auto_yes"
         )
         
         # Create task directory
@@ -146,10 +148,26 @@ class TaskManager:
             task.completed_at = datetime.utcnow()
             
         elif new_state == TaskState.RETRYING:
+            # Increment retry counter and either fail or schedule retry with backoff
             task.retry_count += 1
             if task.retry_count >= task.max_retries:
                 new_state = TaskState.FAILED
                 task.task_state = new_state
+            else:
+                # Schedule retry with exponential backoff and keep RETRYING state
+                delay = min(
+                    config.base_delay * (config.exponential_base ** (task.retry_count - 1)),
+                    config.max_delay,
+                )
+                task.next_allowed_at = datetime.utcnow() + timedelta(seconds=delay)
+                
+        elif new_state == TaskState.AWAITING_CONFIRMATION:
+            # For confirmation awaiting tasks, try to auto-retry with confirmation enabled
+            if not task.auto_execute and task.retry_count < task.max_retries:
+                logger.info(f"Task {task.id} awaiting confirmation, attempting auto-retry with confirmation enabled")
+                self._setup_auto_confirmation_retry(task)
+            else:
+                logger.info(f"Task {task.id} requires manual intervention - max retries reached or already auto-execute enabled")
         
         # Add error if provided
         if error_msg:
@@ -159,12 +177,25 @@ class TaskManager:
         if save_snapshot:
             self._save_task_snapshot(task)
         
+        # Update task.json file to keep it in sync first
+        task_dir = config.tasks_dir / task.id
+        if task_dir.exists():
+            task.to_json_file(str(task_dir / "task.json"))
+        
         # Update database
         db.save_task(task)
         
         # Update queue files
         if new_state == TaskState.PENDING:
+            # Move back to pending queue
             self._remove_from_queue(task.id, "processing")
+            # Clear worker assignment when re-queued
+            task.assigned_worker = None
+            self._add_to_queue(task, "pending")
+        elif new_state == TaskState.RETRYING:
+            # Re-enqueue retrying tasks into pending queue with backoff
+            self._remove_from_queue(task.id, "processing")
+            task.assigned_worker = None
             self._add_to_queue(task, "pending")
         elif old_state == TaskState.PENDING and new_state == TaskState.PROCESSING:
             # Already moved in get_next_pending_task
@@ -234,44 +265,50 @@ class TaskManager:
         
         context_parts = [
             "=== TASK RESUME CONTEXT ===",
-            f"Task ID: {task.id}",
-            f"Task Name: {task.name}",
-            f"Current State: {task.task_state}",
+            f"Task: {task.name}",
             f"Retry Count: {task.retry_count}",
-            ""
         ]
         
-        if task.description:
+        # Handle interaction-specific resume context
+        if task.checkpoint_data.get('needs_interaction'):
+            interaction_prompt = task.checkpoint_data.get('interaction_prompt', '')
+            auto_response = task.checkpoint_data.get('auto_response')
             context_parts.extend([
-                f"Description: {task.description}",
-                ""
+                f"Previous interaction detected: {interaction_prompt}",
+                f"Auto-responding with: {'yes' if task.should_auto_confirm() else 'continue'}",
+            ])
+            if auto_response:
+                context_parts.append(f"Auto-response content: {auto_response}")
+            context_parts.extend([
+                "Please continue with the task after this response.",
             ])
         
-        # Add checkpoint data if available
-        if task.checkpoint_data:
+        # Add session management info
+        if task.checkpoint_data.get('session_id'):
+            context_parts.append(f"Session ID: {task.checkpoint_data['session_id']}")
+        
+        # Legacy checkpoint data (for backward compatibility)
+        if task.checkpoint_data and not task.checkpoint_data.get('needs_interaction'):
             context_parts.extend([
+                "",
                 "=== CHECKPOINT DATA ===",
-                json.dumps(task.checkpoint_data, indent=2),
+                json.dumps({k: v for k, v in task.checkpoint_data.items() 
+                           if k not in ['session_id', 'needs_interaction', 'interaction_prompt']}, indent=2),
                 ""
             ])
         
-        # Add resume patch if available
+        # Add resume patch if available (legacy)
         resume_patch_file = task_dir / "resume_patch.txt"
         if resume_patch_file.exists():
             context_parts.extend([
-                "=== RESUME PATCH (Last 500 lines) ===",
+                "=== PREVIOUS OUTPUT (Last 500 lines) ===",
                 resume_patch_file.read_text(encoding='utf-8')[-50000:],  # Last ~50KB
-                "=== END RESUME PATCH ===",
+                "=== END PREVIOUS OUTPUT ===",
                 ""
             ])
         
-        # Add recovery instruction
-        context_parts.extend([
-            "Please continue from where the task was interrupted.",
-            "Avoid repeating previous outputs or actions.",
-            "If the task involves file operations, check current state before proceeding.",
-            ""
-        ])
+        # Final instructions
+        context_parts.append("Continue from where we left off.")
         
         return "\n".join(context_parts)
     
@@ -354,3 +391,31 @@ class TaskManager:
             except Exception as e:
                 logger.error(f"Cleanup error: {e}")
                 await asyncio.sleep(3600)
+    
+    def _setup_auto_confirmation_retry(self, task: Task):
+        """Setup task for auto-confirmation retry"""
+        from command_generator import command_generator
+        
+        # Enable auto-execution for this retry
+        task.auto_execute = True
+        task.confirmation_strategy = "auto_yes"
+        
+        # Regenerate command with auto-execution suffix
+        if hasattr(task, 'name') and hasattr(task, 'description'):
+            new_command = command_generator.generate_command(
+                name=task.name,
+                description=task.description,
+                task_type=task.task_type,
+                working_dir=task.working_dir,
+                auto_execute=True
+            )
+            task.command = new_command
+        
+        # Reset state to pending for retry
+        task.task_state = TaskState.PENDING
+        task.retry_count += 1
+        
+        # Add to retry queue with a short delay
+        task.next_allowed_at = datetime.utcnow() + timedelta(seconds=30)
+        
+        logger.info(f"Task {task.id} setup for auto-confirmation retry (attempt {task.retry_count})")

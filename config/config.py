@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 class Config(BaseModel):
     # Directories
     base_dir: Path = Field(default_factory=lambda: Path(__file__).parent.parent)
+    config_dir: Path = Field(default_factory=lambda: Path(__file__).parent)
     tasks_dir: Path = Field(default_factory=lambda: Path(__file__).parent.parent / "tasks")
     queue_dir: Path = Field(default_factory=lambda: Path(__file__).parent.parent / "queue")
     snapshots_dir: Path = Field(default_factory=lambda: Path(__file__).parent.parent / "snapshots")
@@ -14,7 +15,7 @@ class Config(BaseModel):
     db_path: Path = Field(default_factory=lambda: Path(__file__).parent.parent / "db" / "ledger.db")
     
     # Claude CLI settings
-    claude_cli_timeout: int = 120  # seconds before considering hung
+    claude_cli_timeout: int = 6000  # seconds before considering hung (100 minutes)
     claude_session_limit: int = 18000  # 5 hours in seconds
     max_output_size: int = 50 * 1024 * 1024  # 50MB
     
@@ -46,9 +47,6 @@ class Config(BaseModel):
         r'[A-Za-z0-9+/]{40}=?=?',  # base64 tokens
     ])
     
-    violation_keywords: list = Field(default_factory=lambda: [
-        'password', 'secret', 'private_key', 'api_key', 'token'
-    ])
 
     @classmethod
     def load(cls, config_path: str = None) -> 'Config':

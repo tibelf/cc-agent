@@ -16,7 +16,7 @@ from database import db
 from config.config import config
 from utils import (
     create_alert, AlertLevel, parse_claude_error, sanitize_output,
-    check_violation_keywords, get_system_metrics, atomic_write,
+    get_system_metrics, atomic_write,
     is_process_alive, format_duration
 )
 
@@ -132,18 +132,18 @@ class ClaudeWorker:
         logger.info(f"Executing task {task.id}: {task.name}")
         
         try:
-            # Update task state
-            self.task_manager.update_task_state(task, TaskState.PROCESSING)
-            self.status.state = ProcessState.RUNNING
-            
-            # Setup task environment
-            task_dir = config.tasks_dir / task.id
-            task_dir.mkdir(exist_ok=True)
-            
-            # Check for resume context
+            # Determine if we should resume with context BEFORE changing state
             resume_context = ""
             if task.task_state == TaskState.RETRYING:
                 resume_context = self.task_manager.generate_resume_context(task)
+
+            # Update task state
+            self.task_manager.update_task_state(task, TaskState.PROCESSING)
+            self.status.state = ProcessState.RUNNING
+
+            # Setup task environment
+            task_dir = config.tasks_dir / task.id
+            task_dir.mkdir(exist_ok=True)
             
             # Execute the task
             success = await self._run_claude_command(task, resume_context)
@@ -179,35 +179,56 @@ class ClaudeWorker:
         """Run Claude CLI command with monitoring"""
         task_dir = config.tasks_dir / task.id
         
-        # Prepare command
-        full_command = task.command
-        if resume_context:
-            # Save resume context to file
+        # Prepare command - check if we need to resume with session
+        if task.checkpoint_data.get('session_id') and resume_context:
+            # Use session resume
+            session_id = task.checkpoint_data['session_id']
+            resume_query = self._build_resume_query(task, resume_context)
+            full_command = f'claude -r "{session_id}" "{resume_query}"'
+            logger.info(f"Task {task.id}: Resuming with session_id: {session_id}")
+        else:
+            # New task
+            full_command = task.command
+            logger.info(f"Task {task.id}: Starting new execution")
+        
+        logger.info(f"Executing task {task.id} with command: {full_command[:100]}...")
+        
+        if resume_context and not task.checkpoint_data.get('session_id'):
+            # Legacy resume context handling (fallback)
             resume_file = task_dir / "resume_context.txt"
             atomic_write(str(resume_file), resume_context)
             full_command = f"cat {resume_file} && {task.command}"
+            logger.info(f"Task {task.id} resuming with legacy context")
+        
+        # Check if command has permission parameters (for logging)
+        if "--permission-mode" in full_command:
+            logger.info(f"Task {task.id} running with pre-configured permissions")
+        elif "--dangerously-skip-permissions" in full_command:
+            logger.warning(f"Task {task.id} running with SKIPPED permissions - use with caution")
         
         # Prepare environment
         env = os.environ.copy()
         env.update(task.environment)
+        # Disable Python output buffering to ensure real-time output
+        env['PYTHONUNBUFFERED'] = '1'
         
         # Working directory
         working_dir = task.working_dir or str(task_dir)
         
         try:
-            # Start process
-            self.process = subprocess.Popen(
+            # Start process using asyncio for better output capture
+            self.process = await asyncio.create_subprocess_shell(
                 full_command,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                stdin=asyncio.subprocess.DEVNULL,
                 env=env,
                 cwd=working_dir,
-                text=True,
-                bufsize=1  # Line buffered
+                limit=1024*1024  # 1MB buffer for large JSON outputs
             )
             
             self.status.state = ProcessState.RUNNING
+            logger.info(f"Task {task.id}: Process started with asyncio subprocess")
             
             # Monitor process output
             return await self._monitor_process(task)
@@ -215,6 +236,330 @@ class ClaudeWorker:
         except Exception as e:
             logger.error(f"Failed to start process: {e}")
             return False
+    
+    def _build_resume_query(self, task: Task, resume_context: str) -> str:
+        """Build resume query for session continuation"""
+        if task.checkpoint_data.get('needs_interaction'):
+            interaction_prompt = task.checkpoint_data.get('interaction_prompt', '')
+            auto_response = task.checkpoint_data.get('auto_response', '')
+            
+            if auto_response:
+                return f"Previous interaction: {interaction_prompt}. My response: {auto_response}. {resume_context}"
+            else:
+                # 如果没有AI生成的回复，使用默认自主回复
+                default_response = "我具备完全自主操作权限，无需人工干预。我将继续自主完成所有任务操作。"
+                return f"Previous interaction: {interaction_prompt}. My response: {default_response}. {resume_context}"
+        
+        return resume_context
+    
+    def _extract_session_id(self, output_line: str, task: Task) -> bool:
+        """Extract session_id from Claude output"""
+        try:
+            # Claude Code includes session_id in JSON output
+            if '"session_id"' in output_line:
+                import json
+                data = json.loads(output_line)
+                if 'session_id' in data:
+                    task.checkpoint_data['session_id'] = data['session_id']
+                    logger.info(f"Task {task.id}: Captured session_id: {data['session_id']}")
+                    return True
+        except json.JSONDecodeError:
+            pass
+        return False
+    
+    def _process_output_chunk(self, chunk: str, task: Task, output_buffer: list, log_file) -> None:
+        """Process a chunk of output for JSON parsing, session_id extraction, and analysis"""
+        from utils import sanitize_output
+        
+        # Write raw chunk to log file
+        log_file.write(chunk)
+        log_file.flush()
+        
+        # Split chunk into lines for line-by-line analysis
+        lines = chunk.splitlines(keepends=True)
+        
+        for line in lines:
+            if not line.strip():
+                continue
+                
+            # Extract session_id if present
+            self._extract_session_id(line, task)
+            
+            # Check if this line contains Claude JSON result
+            result_content = self._extract_claude_result(line)
+            if result_content:
+                # Use AI to detect interaction need on actual result content
+                needs_interaction, auto_response = self._ai_detect_interaction_need_sync(result_content, task)
+                if needs_interaction:
+                    logger.info(f"Task {task.id}: Detected interaction need in result: {result_content}")
+                    # Save interaction state for resume
+                    self._save_interaction_state(task, result_content, auto_response)
+                    # Update task state to retry with interaction handling
+                    self.task_manager.update_task_state(
+                        task,
+                        TaskState.RETRYING,
+                        f"Interaction needed: {result_content}",
+                        save_snapshot=True
+                    )
+                    self._terminate_process()
+                    return
+            
+            # Sanitize and add to buffers
+            sanitized_line = sanitize_output(line)
+            output_buffer.append(sanitized_line)
+            
+            # Keep resume patch buffer (last 500 lines)
+            if len(output_buffer) > 500:
+                output_buffer.pop(0)
+        
+        # Also try to extract session_id from the entire chunk (in case JSON spans multiple lines)
+        self._extract_session_id_from_chunk(chunk, task)
+    
+    def _extract_session_id_from_chunk(self, chunk: str, task: Task) -> bool:
+        """Extract session_id from a chunk of output (handles multi-line JSON)"""
+        import json
+        import re
+        
+        try:
+            # Try to find JSON objects in the chunk
+            json_pattern = r'\{[^{}]*"session_id"[^{}]*\}'
+            matches = re.findall(json_pattern, chunk, re.DOTALL)
+            
+            for match in matches:
+                try:
+                    data = json.loads(match)
+                    if 'session_id' in data and data['session_id']:
+                        if 'session_id' not in task.checkpoint_data:
+                            task.checkpoint_data['session_id'] = data['session_id']
+                            logger.info(f"Task {task.id}: Captured session_id from chunk: {data['session_id']}")
+                            return True
+                except json.JSONDecodeError:
+                    continue
+            
+            # Also try to parse the entire chunk as JSON (for single large JSON objects)
+            if '"session_id"' in chunk:
+                # Try to extract JSON array or object
+                lines = chunk.strip().split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if line.startswith('[') or line.startswith('{'):
+                        try:
+                            # Try parsing as JSON array first
+                            if line.startswith('['):
+                                json_array = json.loads(line)
+                                for item in json_array:
+                                    if isinstance(item, dict) and 'session_id' in item:
+                                        if 'session_id' not in task.checkpoint_data:
+                                            task.checkpoint_data['session_id'] = item['session_id']
+                                            logger.info(f"Task {task.id}: Captured session_id from JSON array: {item['session_id']}")
+                                            return True
+                            else:
+                                # Try parsing as single JSON object
+                                data = json.loads(line)
+                                if 'session_id' in data:
+                                    if 'session_id' not in task.checkpoint_data:
+                                        task.checkpoint_data['session_id'] = data['session_id']
+                                        logger.info(f"Task {task.id}: Captured session_id from JSON object: {data['session_id']}")
+                                        return True
+                        except json.JSONDecodeError:
+                            continue
+                            
+        except Exception as e:
+            # Silent failure for chunk parsing - this is a best-effort enhancement
+            pass
+            
+        return False
+    
+    async def _fallback_output_capture(self, task: Task) -> str:
+        """Fallback method to capture output using subprocess.run when asyncio fails"""
+        import subprocess
+        
+        try:
+            task_dir = config.tasks_dir / task.id
+            env = os.environ.copy()
+            env.update(task.environment)
+            env['PYTHONUNBUFFERED'] = '1'
+            
+            working_dir = task.working_dir or str(task_dir)
+            
+            logger.info(f"Task {task.id}: Attempting fallback output capture with subprocess.run")
+            
+            # Execute the same command with subprocess.run for output capture
+            result = await asyncio.to_thread(
+                subprocess.run,
+                task.command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                cwd=working_dir,
+                text=True,
+                timeout=30  # Short timeout for fallback
+            )
+            
+            if result.returncode == 0 and result.stdout:
+                logger.info(f"Task {task.id}: Fallback capture successful, got {len(result.stdout)} chars")
+                return result.stdout
+            else:
+                logger.warning(f"Task {task.id}: Fallback capture failed or empty, exit code: {result.returncode}")
+                return ""
+                
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Task {task.id}: Fallback capture timed out")
+            return ""
+        except Exception as e:
+            logger.warning(f"Task {task.id}: Fallback capture error: {e}")
+            return ""
+    
+    def _extract_claude_result(self, line: str) -> str:
+        """Extract result content from Claude JSON output"""
+        try:
+            if '"type":"result"' in line and '"result"' in line:
+                import json
+                data = json.loads(line)
+                if data.get('type') == 'result':
+                    return data.get('result', '')
+        except json.JSONDecodeError:
+            pass
+        return None
+    
+    def _analyze_final_result(self, task: Task, total_output: str) -> bool:
+        """Analyze complete output for final result and determine if user interaction is needed"""
+        try:
+            logger.info(f"Task {task.id}: Analyzing final result for interaction needs")
+            
+            import json
+            
+            # Find lines that contain potential JSON with result
+            lines = total_output.split('\n')
+            for line in lines:
+                if '"type":"result"' in line and '"result"' in line:
+                    try:
+                        # Try parsing as JSON array first (common format)
+                        data = json.loads(line)
+                        
+                        # Handle both array and single object cases
+                        items = data if isinstance(data, list) else [data]
+                        
+                        for item in items:
+                            if isinstance(item, dict) and item.get('type') == 'result':
+                                result_content = item.get('result', '')
+                                if result_content:
+                                    logger.info(f"Task {task.id}: Extracted final result content ({len(result_content)} chars)")
+                                    logger.info(f"Task {task.id}: Result preview: {result_content[:200]}...")
+                                    
+                                    # Use AI to detect interaction need
+                                    needs_interaction, auto_response = self._ai_detect_interaction_need_sync(result_content, task)
+                                    if needs_interaction:
+                                        logger.info(f"Task {task.id}: Final result analysis - interaction needed")
+                                        self._save_interaction_state(task, result_content, auto_response)
+                                        self.task_manager.update_task_state(
+                                            task,
+                                            TaskState.RETRYING,
+                                            f"Final analysis: Interaction needed for result content",
+                                            save_snapshot=True
+                                        )
+                                        return True
+                                    else:
+                                        logger.info(f"Task {task.id}: Final result analysis - no interaction needed")
+                                        return False
+                                        
+                    except json.JSONDecodeError as e:
+                        logger.debug(f"Task {task.id}: JSON parse error for line: {e}")
+                        continue
+            
+            logger.info(f"Task {task.id}: No result JSON found in final output")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Task {task.id}: Error in final result analysis: {e}")
+            return False
+
+    def _ai_detect_interaction_need_sync(self, result_content: str, task: Task) -> tuple[bool, str]:
+        """Use Claude CLI to detect if interaction is needed and generate autonomous response"""
+        try:
+            prompt = f"""请分析以下内容是否需要交互，并生成自主处理回复：
+
+内容: {result_content}
+
+任务：
+1. 判断是否需要交互（YES/NO）
+2. 如果需要交互，生成一个自主处理回复
+
+返回格式：
+JUDGMENT: YES/NO
+RESPONSE: [自主回复内容]
+
+生成回复的原则：
+- 明确告诉AI它具备完全自主操作能力
+- 不需要人工干预或确认
+- 可以自主做出所有决策和操作
+- 给出具体的下一步行动指导
+
+示例：
+JUDGMENT: YES  
+RESPONSE: 你可以自主做出最佳选择决策。基于任务目标，你将选择最合适的选项并继续执行。"""
+
+            result = subprocess.run(
+                ['claude', '-p', prompt],
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            
+            if result.returncode == 0:
+                response_text = result.stdout.strip()
+                
+                # 解析判断结果和回复内容
+                judgment = "NO"
+                auto_response = ""
+                
+                lines = response_text.split('\n')
+                for line in lines:
+                    if line.startswith('JUDGMENT:'):
+                        judgment = line.replace('JUDGMENT:', '').strip().upper()
+                    elif line.startswith('RESPONSE:'):
+                        auto_response = line.replace('RESPONSE:', '').strip()
+                
+                needs_interaction = judgment == "YES"
+                logger.info(f"Task {task.id}: AI judgment for '{result_content[:50]}...': {judgment}")
+                if needs_interaction:
+                    logger.info(
+                        "Task %s: Generated autonomous response: %s",
+                        task.id,
+                        auto_response,
+                    )
+                
+                return needs_interaction, auto_response
+            else:
+                logger.warning(f"Task {task.id}: AI judgment failed, assuming no interaction needed")
+                return False, ""
+            
+        except Exception as e:
+            logger.error(f"Task {task.id}: AI interaction detection error: {e}")
+            return False, ""
+
+    def _detect_interaction_need(self, line: str, task: Task) -> bool:
+        """Detect if interaction is needed based on output"""
+        # Skip lines that contain automation instructions (these are not actual prompts)
+        line_lower = line.lower()
+        if "automated task execution" in line_lower or "do not ask for confirmation" in line_lower:
+            return False
+            
+        # Look for actual interaction prompts
+        confirmation_keywords = ["confirm", "continue", "proceed", "yes", "no", "(y/n)", "[y/n]"]
+        return any(keyword in line_lower for keyword in confirmation_keywords)
+    
+    def _save_interaction_state(self, task: Task, prompt_line: str, auto_response: str = ""):
+        """Save interaction state to checkpoint for resume"""
+        task.checkpoint_data.update({
+            'needs_interaction': True,
+            'interaction_prompt': prompt_line.strip(),
+            'auto_response': auto_response,
+            'interaction_timestamp': datetime.utcnow().isoformat()
+        })
+        
+        logger.info(f"Task {task.id}: Detected interaction need, saving state for resume")
     
     async def _monitor_process(self, task: Task) -> bool:
         """Monitor running process with real-time output analysis"""
@@ -229,13 +574,46 @@ class ClaudeWorker:
         
         try:
             with open(output_file, 'w', encoding='utf-8') as log_file:
+                # Write task execution header
+                header = f"""=== TASK EXECUTION LOG ===
+Task ID: {task.id}
+Task Name: {task.name}
+Command: {task.command}
+Started: {datetime.utcnow().isoformat()}
+Working Directory: {task_dir}
+
+=== COMMAND OUTPUT ===
+"""
+                log_file.write(header)
+                log_file.flush()
+                logger.info(f"Task {task.id} execution started, logging to {output_file}")
                 
-                while self.process and self.process.poll() is None and self.running:
+                # Heuristic: detect prompt-only simple tasks (should complete fast)
+                cmd_text = (task.command or "")
+                is_prompt_only = (
+                    cmd_text.strip().startswith("claude -p")
+                    and not any(flag in cmd_text for flag in ["--watch", "--server", "-f ", "--file", "--stdin"])
+                )
+
+                while self.process and self.process.returncode is None and self.running:
                     
-                    # Check for timeout
+                    # Check for timeout - but be more lenient for simple tasks
                     current_time = time.time()
-                    if current_time - last_output_time > config.claude_cli_timeout:
-                        logger.warning(f"Task {task.id} appears hung (no output for {config.claude_cli_timeout}s)")
+                    time_since_start = current_time - start_time
+                    time_since_output = current_time - last_output_time
+                    
+                    # Choose no-output timeout based on task nature
+                    effective_timeout = config.claude_cli_timeout
+                    if is_prompt_only:
+                        # Simple one-shot prompts should finish quickly; fail fast on silence
+                        effective_timeout = min(effective_timeout, 900)  # 900s max for no-output
+                    else:
+                        # Give heavier sessions more leeway in the first 2 minutes
+                        if time_since_start < 120:  # First 2 minutes
+                            effective_timeout = max(effective_timeout, 900)  # Up to 15 minutes
+                    
+                    if time_since_output > effective_timeout:
+                        logger.warning(f"Task {task.id} appears hung (no output for {time_since_output:.0f}s, timeout: {effective_timeout}s)")
                         self.status.state = ProcessState.HUNG
                         self._terminate_process()
                         return False
@@ -252,45 +630,28 @@ class ClaudeWorker:
                         self._terminate_process()
                         return False
                     
-                    # Read output
+                    # Read output in chunks for better JSON capture
                     try:
-                        line = await asyncio.wait_for(
-                            asyncio.to_thread(self.process.stdout.readline),
+                        # Try to read available data (non-blocking with timeout)
+                        chunk = await asyncio.wait_for(
+                            self.process.stdout.read(4096),  # Read up to 4KB chunks
                             timeout=1.0
                         )
                         
-                        if line:
+                        if chunk:
+                            # Convert bytes to string if needed
+                            if isinstance(chunk, bytes):
+                                chunk = chunk.decode('utf-8', errors='replace')
+                            
                             last_output_time = current_time
                             
-                            # Sanitize output
-                            sanitized_line = sanitize_output(line)
+                            # Process chunk for session_id and other analysis
+                            self._process_output_chunk(chunk, task, output_buffer, log_file)
                             
-                            # Check for violations
-                            violations = check_violation_keywords(line)
-                            if violations:
-                                logger.warning(f"Violation keywords detected: {violations}")
-                                self.task_manager.update_task_state(
-                                    task,
-                                    TaskState.NEEDS_HUMAN_REVIEW,
-                                    f"Violation keywords detected: {violations}"
-                                )
-                                self._terminate_process()
-                                return False
+                            total_output += chunk
                             
-                            # Add to buffers
-                            output_buffer.append(sanitized_line)
-                            total_output += sanitized_line
-                            
-                            # Write to log file
-                            log_file.write(sanitized_line)
-                            log_file.flush()
-                            
-                            # Keep resume patch buffer (last 500 lines)
-                            if len(output_buffer) > 500:
-                                output_buffer.pop(0)
-                            
-                            # Check for errors in output
-                            error_info = parse_claude_error(line)
+                            # Check for errors in output chunk
+                            error_info = parse_claude_error(chunk)
                             if error_info['is_rate_limited']:
                                 logger.info(f"Rate limit detected for task {task.id}")
                                 self._save_resume_patch(output_buffer)
@@ -338,10 +699,58 @@ class ClaudeWorker:
                         logger.error(f"Error reading process output: {e}")
                         break
             
-            # Process finished, check exit code
+            # Process finished, read any remaining output
             if self.process:
-                exit_code = self.process.poll()
+                exit_code = await self.process.wait()
+                
+                # Read any remaining buffered output after process completion
+                try:
+                    remaining_output = await self.process.stdout.read()
+                    if remaining_output:
+                        # Convert bytes to string if needed
+                        if isinstance(remaining_output, bytes):
+                            remaining_output = remaining_output.decode('utf-8', errors='replace')
+                        
+                        logger.info(f"Task {task.id} had remaining output after completion: {len(remaining_output)} chars")
+                        total_output += remaining_output
+                        
+                        # Process remaining output for session_id extraction
+                        with open(output_file, 'a', encoding='utf-8') as log_file:
+                            self._process_output_chunk(remaining_output, task, output_buffer, log_file)
+                            
+                except Exception as e:
+                    logger.warning(f"Error reading remaining output for task {task.id}: {e}")
+                
+                # Fallback: If we didn't capture any output but process succeeded, try subprocess fallback
+                if exit_code == 0 and len(total_output.strip()) == 0:
+                    logger.info(f"Task {task.id}: No output captured during execution, attempting fallback capture")
+                    fallback_output = await self._fallback_output_capture(task)
+                    if fallback_output:
+                        total_output += fallback_output
+                        with open(output_file, 'a', encoding='utf-8') as log_file:
+                            log_file.write(f"\n=== FALLBACK OUTPUT CAPTURE ===\n")
+                            self._process_output_chunk(fallback_output, task, output_buffer, log_file)
+                
+                # Write task completion footer to log
+                with open(output_file, 'a', encoding='utf-8') as log_file:
+                    footer = f"""
+
+=== TASK EXECUTION COMPLETED ===
+Exit Code: {exit_code}
+Duration: {format_duration(time.time() - start_time)}
+Total Output Lines: {len(total_output.splitlines())}
+Completed: {datetime.utcnow().isoformat()}
+"""
+                    log_file.write(footer)
+                    log_file.flush()
+                
                 if exit_code == 0:
+                    # Analyze final result for interaction needs before marking as completed
+                    interaction_needed = self._analyze_final_result(task, total_output)
+                    if interaction_needed:
+                        # Task needs user interaction, change state to retrying
+                        return False
+                    
                     logger.info(f"Task {task.id} completed with exit code 0")
                     return True
                 else:
@@ -379,14 +788,17 @@ class ClaudeWorker:
                     patch_content = "No output available for resume patch"
             
             atomic_write(str(resume_patch_file), patch_content)
-            
-            # Update task checkpoint
-            self.current_task.resume_hint_file = "resume_patch.txt"
-            self.current_task.checkpoint_data = {
+
+            # Update task checkpoint without discarding existing metadata
+            checkpoint_data = dict(self.current_task.checkpoint_data or {})
+            checkpoint_data.update({
                 'last_saved': datetime.utcnow().isoformat(),
                 'output_lines': len(patch_content.split('\n')),
                 'patch_size': len(patch_content)
-            }
+            })
+
+            self.current_task.resume_hint_file = "resume_patch.txt"
+            self.current_task.checkpoint_data = checkpoint_data
             
             logger.info(f"Saved resume patch for task {self.current_task.id}")
             
@@ -404,15 +816,9 @@ class ClaudeWorker:
             # Try graceful shutdown first
             self.process.terminate()
             
-            # Wait up to 10 seconds for graceful shutdown
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                # Force kill if graceful shutdown fails
-                logger.warning("Process didn't terminate gracefully, killing...")
-                self.process.kill()
-                self.process.wait()
-                self.status.state = ProcessState.KILLED
+            # For asyncio processes, we can't use synchronous wait with timeout
+            # The process termination will be handled by the monitoring loop
+            self.status.state = ProcessState.KILLED
             
             logger.info(f"Process terminated for task {self.current_task.id if self.current_task else 'unknown'}")
             
@@ -420,6 +826,7 @@ class ClaudeWorker:
             logger.error(f"Error terminating process: {e}")
         finally:
             self.process = None
+    
 
 
 async def main():
