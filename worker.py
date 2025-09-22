@@ -241,15 +241,20 @@ class ClaudeWorker:
         """Build resume query for session continuation"""
         if task.checkpoint_data.get('needs_interaction'):
             interaction_prompt = task.checkpoint_data.get('interaction_prompt', '')
-            auto_response = task.checkpoint_data.get('auto_response', '')
-            
-            if auto_response:
-                return f"Previous interaction: {interaction_prompt}. My response: {auto_response}. {resume_context}"
-            else:
-                # 如果没有AI生成的回复，使用默认自主回复
-                default_response = "我具备完全自主操作权限，无需人工干预。我将继续自主完成所有任务操作。"
-                return f"Previous interaction: {interaction_prompt}. My response: {default_response}. {resume_context}"
-        
+            auto_response = task.checkpoint_data.get('auto_response', '').strip()
+
+            if not auto_response:
+                auto_response = "我具备完全自主操作权限，无需人工干预。我将继续自主完成所有任务操作。"
+
+            segments = []
+            if interaction_prompt:
+                segments.append(interaction_prompt.strip())
+            segments.append(auto_response)
+            if resume_context:
+                segments.append(resume_context.strip())
+
+            return "\n\n".join(filter(None, segments)).strip()
+
         return resume_context
     
     def _extract_session_id(self, output_line: str, task: Task) -> bool:
@@ -478,27 +483,22 @@ class ClaudeWorker:
     def _ai_detect_interaction_need_sync(self, result_content: str, task: Task) -> tuple[bool, str]:
         """Use Claude CLI to detect if interaction is needed and generate autonomous response"""
         try:
-            prompt = f"""请分析以下内容是否需要交互，并生成自主处理回复：
+            prompt = f"""请判断以下文本是否是在请求我们做出确认或选择，并给出可直接执行的答复。
 
-内容: {result_content}
+TEXT: {result_content}
 
-任务：
-1. 判断是否需要交互（YES/NO）
-2. 如果需要交互，生成一个自主处理回复
+要求：
+1. 如果文本需要我们确认或选择，输出 JUDGMENT: YES，并在 RESPONSE 中给出可以直接回复给对方的内容。
+   - 若原文包含编号选项（如“1.”、“2.”），直接返回对应的数字或字母。
+   - 否则使用原语言给出简洁明确的回答，例如 “Yes, please proceed.”。
+   - 不允许输出解释、理由或其他附加说明。
+2. 如果不是确认请求，输出 JUDGMENT: NO，并让 RESPONSE 为空。
 
-返回格式：
+输出格式必须严格如下：
 JUDGMENT: YES/NO
-RESPONSE: [自主回复内容]
+RESPONSE: <直接回复内容或留空>
 
-生成回复的原则：
-- 明确告诉AI它具备完全自主操作能力
-- 不需要人工干预或确认
-- 可以自主做出所有决策和操作
-- 给出具体的下一步行动指导
-
-示例：
-JUDGMENT: YES  
-RESPONSE: 你可以自主做出最佳选择决策。基于任务目标，你将选择最合适的选项并继续执行。"""
+不要输出任何其他文本。"""
 
             result = subprocess.run(
                 ['claude', '-p', prompt],
@@ -520,10 +520,25 @@ RESPONSE: 你可以自主做出最佳选择决策。基于任务目标，你将�
                         judgment = line.replace('JUDGMENT:', '').strip().upper()
                     elif line.startswith('RESPONSE:'):
                         auto_response = line.replace('RESPONSE:', '').strip()
+
+                auto_response = auto_response.strip()
                 
                 needs_interaction = judgment == "YES"
                 logger.info(f"Task {task.id}: AI judgment for '{result_content[:50]}...': {judgment}")
                 if needs_interaction:
+                    generic_markers = [
+                        "自主", "自行", "autonom", "best choice", "choose the best option",
+                        "make the best decision", "you can decide"
+                    ]
+                    normalized_response = auto_response.lower()
+                    if not auto_response or any(
+                        marker in auto_response or marker in normalized_response
+                        for marker in generic_markers
+                    ):
+                        logger.warning(
+                            "Task %s: AI response not actionable, retrying detection", task.id
+                        )
+                        return False, ""
                     logger.info(
                         "Task %s: Generated autonomous response: %s",
                         task.id,

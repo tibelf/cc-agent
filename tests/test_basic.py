@@ -403,7 +403,7 @@ class TestAutoConfirmation:
     def test_confirmation_prompt_detection(self):
         """Test confirmation prompt pattern matching"""
         from worker import ClaudeWorker
-        
+
         worker = ClaudeWorker("test_worker")
         
         # Create test task with auto-confirmation enabled
@@ -441,6 +441,68 @@ class TestAutoConfirmation:
         for text in non_prompts:
             response = worker._handle_confirmation_prompt(task, text)
             assert response is None, f"False positive on: {text}"
+
+    def test_ai_confirmation_response_actionable(self, monkeypatch):
+        """Ensure AI-generated confirmation replies are actionable"""
+        from worker import ClaudeWorker, subprocess as worker_subprocess
+
+        worker = ClaudeWorker("test_worker")
+        task = Task(
+            id="test_ai_response",
+            name="Test",
+            command="echo test",
+            auto_execute=True,
+            confirmation_strategy="auto_yes"
+        )
+
+        class DummyResult:
+            def __init__(self, stdout):
+                self.returncode = 0
+                self.stdout = stdout
+
+        def fake_run(*args, **kwargs):
+            return DummyResult("JUDGMENT: YES\nRESPONSE: 1")
+
+        monkeypatch.setattr(worker_subprocess, "run", fake_run)
+
+        needs_interaction, auto_response = worker._ai_detect_interaction_need_sync(
+            "Would you like me to proceed? 1. Yes 2. No",
+            task,
+        )
+
+        assert needs_interaction is True
+        assert auto_response == "1"
+
+    def test_ai_confirmation_response_generic_retry(self, monkeypatch):
+        """Generic AI replies should trigger a retry instead of acceptance"""
+        from worker import ClaudeWorker, subprocess as worker_subprocess
+
+        worker = ClaudeWorker("test_worker")
+        task = Task(
+            id="test_ai_generic",
+            name="Test",
+            command="echo test",
+            auto_execute=True,
+            confirmation_strategy="auto_yes"
+        )
+
+        class DummyResult:
+            def __init__(self, stdout):
+                self.returncode = 0
+                self.stdout = stdout
+
+        def fake_run(*args, **kwargs):
+            return DummyResult("JUDGMENT: YES\nRESPONSE: 你可以自主做出最佳选择决策。")
+
+        monkeypatch.setattr(worker_subprocess, "run", fake_run)
+
+        needs_interaction, auto_response = worker._ai_detect_interaction_need_sync(
+            "Would you like me to proceed?",
+            task,
+        )
+
+        assert needs_interaction is False
+        assert auto_response == ""
     
     def test_task_manager_auto_retry_setup(self):
         """Test task manager auto-retry setup for confirmation failures"""
