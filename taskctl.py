@@ -7,6 +7,7 @@ import click
 import json
 import sys
 import asyncio
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -19,6 +20,7 @@ from utils import setup_logging, format_duration
 from security import security_manager
 from monitoring import MonitoringService
 from command_generator import command_generator
+from crontab_manager import crontab_manager, ScheduledTask
 
 
 @click.group()
@@ -500,16 +502,54 @@ def system():
 def status():
     """Show system status"""
     try:
-        monitoring = MonitoringService()
-        status = monitoring.get_health_status()
+        import psutil
+        import os
+        
+        # Check if auto_claude.py is running
+        auto_claude_running = False
+        auto_claude_pid = None
+        auto_claude_uptime = 0
+        
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'create_time']):
+            try:
+                if proc.info['cmdline'] and any('auto_claude.py' in arg for arg in proc.info['cmdline']):
+                    auto_claude_running = True
+                    auto_claude_pid = proc.info['pid']
+                    auto_claude_uptime = int(time.time() - proc.info['create_time'])
+                    break
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        
+        # Get monitoring service status if available
+        try:
+            monitoring = MonitoringService()
+            health_status = monitoring.get_health_status()
+        except:
+            health_status = None
+        
+        # Determine overall system status
+        if auto_claude_running:
+            overall_status = 'healthy'
+        else:
+            overall_status = 'critical'
         
         click.echo("System Status")
         click.echo("=" * 50)
-        click.echo(f"Overall Status: {status['status']}")
-        click.echo(f"Timestamp: {status['timestamp']}")
+        click.echo(f"Overall Status: {overall_status}")
+        click.echo(f"Timestamp: {datetime.utcnow().isoformat()}Z")
         
-        if 'metrics' in status:
-            metrics = status['metrics']
+        # Auto-Claude Process Status
+        click.echo(f"\nAuto-Claude Worker Service:")
+        if auto_claude_running:
+            click.echo(f"  Status: Running (PID: {auto_claude_pid})")
+            click.echo(f"  Uptime: {auto_claude_uptime} seconds")
+        else:
+            click.echo(f"  Status: Not running")
+            click.echo(f"  To start: python auto_claude.py &")
+        
+        # Additional metrics from monitoring service
+        if health_status and 'metrics' in health_status:
+            metrics = health_status['metrics']
             click.echo(f"\nResources:")
             click.echo(f"  Disk free: {metrics['disk_free_gb']:.1f} GB")
             click.echo(f"  Memory usage: {metrics['memory_usage_percent']:.1f}%")
@@ -521,9 +561,23 @@ def status():
             click.echo(f"  Processing: {metrics['processing_tasks']}")
             click.echo(f"  Failed: {metrics['failed_tasks']}")
             click.echo(f"  Completed: {metrics['completed_tasks']}")
+        else:
+            # Fallback: get basic task counts from database
+            try:
+                tasks = db.get_tasks_by_state(['pending'])
+                pending_count = len(tasks) if tasks else 0
+                tasks = db.get_tasks_by_state(['processing'])
+                processing_count = len(tasks) if tasks else 0
+                
+                click.echo(f"\nTasks:")
+                click.echo(f"  Pending: {pending_count}")
+                click.echo(f"  Processing: {processing_count}")
+            except:
+                click.echo(f"\nTasks: Unable to fetch task counts")
         
-        if 'alerts' in status:
-            alerts = status['alerts']
+        # Alerts
+        if health_status and 'alerts' in health_status:
+            alerts = health_status['alerts']
             click.echo(f"\nAlerts:")
             click.echo(f"  Unresolved: {alerts['unresolved_count']}")
             click.echo(f"  Recent rate limits: {alerts['recent_rate_limits']}")
@@ -623,6 +677,178 @@ WantedBy=multi-user.target
         click.echo("   Run as root or manually create /etc/systemd/system/auto-claude.service")
     except Exception as e:
         click.echo(f"⚠️  Could not create systemd service: {e}")
+
+
+@cli.group()
+def schedule():
+    """Scheduled task management commands"""
+    pass
+
+
+@schedule.command()
+@click.argument('name')
+@click.option('--description', '-d', required=True, help='Task description - what you want Claude to do')
+@click.option('--cron', '-c', required=True, help='Cron expression (e.g., "0 9 * * 1-5" for weekdays at 9am)')
+@click.option('--type', 'task_type', 
+              type=click.Choice(['lightweight', 'medium_context', 'heavy_context']),
+              default='heavy_context', help='Task type')
+@click.option('--working-dir', help='Working directory for task')
+def add(name, description, cron, task_type, working_dir):
+    """Add a scheduled task to crontab"""
+    try:
+        click.echo(f"Creating scheduled task: {name}")
+        
+        # Validate cron expression
+        if not crontab_manager.validate_cron_expression(cron):
+            click.echo(f"❌ Invalid cron expression: {cron}")
+            click.echo("Format: minute hour day month weekday")
+            click.echo("Example: '0 9 * * 1-5' (weekdays at 9am)")
+            return
+        
+        # Add scheduled task
+        task_id = crontab_manager.add_scheduled_task(
+            name=name,
+            description=description,
+            cron_expr=cron,
+            task_type=task_type,
+            working_dir=working_dir
+        )
+        
+        click.echo(f"✅ Scheduled task added successfully!")
+        click.echo(f"   Task ID: {task_id}")
+        click.echo(f"   Name: {name}")
+        click.echo(f"   Schedule: {cron}")
+        click.echo(f"   Type: {task_type}")
+        click.echo(f"   Description: {description}")
+        
+    except ValueError as e:
+        click.echo(f"❌ Validation error: {e}", err=True)
+        sys.exit(1)
+    except RuntimeError as e:
+        click.echo(f"❌ System error: {e}", err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(f"❌ Error creating scheduled task: {e}", err=True)
+        sys.exit(1)
+
+
+@schedule.command()
+@click.option('--format', 'output_format', type=click.Choice(['table', 'json']), default='table')
+def list(output_format):
+    """List all scheduled tasks"""
+    try:
+        tasks = crontab_manager.list_scheduled_tasks()
+        
+        if not tasks:
+            click.echo("No scheduled tasks found.")
+            return
+        
+        if output_format == 'json':
+            task_data = []
+            for task in tasks:
+                task_data.append({
+                    'task_id': task.task_id,
+                    'name': task.name,
+                    'description': task.description,
+                    'cron_expression': task.cron_expr,
+                    'task_type': task.task_type,
+                    'working_dir': task.working_dir,
+                    'enabled': task.enabled,
+                    'created_at': task.created_at.isoformat()
+                })
+            click.echo(json.dumps(task_data, indent=2))
+        else:
+            # Table format
+            click.echo(f"{'Name':<20} {'Schedule':<15} {'Type':<15} {'Status':<8} {'Created':<12}")
+            click.echo("-" * 78)
+            
+            for task in tasks:
+                status = "Enabled" if task.enabled else "Disabled"
+                created_str = task.created_at.strftime('%Y-%m-%d')
+                click.echo(f"{task.name[:20]:<20} {task.cron_expr:<15} {task.task_type:<15} {status:<8} {created_str:<12}")
+        
+    except RuntimeError as e:
+        click.echo(f"❌ System error: {e}", err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(f"❌ Error listing scheduled tasks: {e}", err=True)
+        sys.exit(1)
+
+
+@schedule.command()
+@click.argument('task_id')
+def remove(task_id):
+    """Remove a scheduled task by task ID"""
+    try:
+        if crontab_manager.remove_scheduled_task(task_id):
+            click.echo(f"✅ Scheduled task {task_id} removed successfully")
+        else:
+            click.echo(f"❌ Scheduled task {task_id} not found")
+            sys.exit(1)
+            
+    except RuntimeError as e:
+        click.echo(f"❌ System error: {e}", err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(f"❌ Error removing scheduled task: {e}", err=True)
+        sys.exit(1)
+
+
+@schedule.command()
+@click.argument('name')
+def remove_by_name(name):
+    """Remove a scheduled task by name"""
+    try:
+        if crontab_manager.remove_scheduled_task_by_name(name):
+            click.echo(f"✅ Scheduled task '{name}' removed successfully")
+        else:
+            click.echo(f"❌ Scheduled task '{name}' not found")
+            sys.exit(1)
+            
+    except RuntimeError as e:
+        click.echo(f"❌ System error: {e}", err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(f"❌ Error removing scheduled task: {e}", err=True)
+        sys.exit(1)
+
+
+@schedule.command()
+@click.argument('task_id')
+def enable(task_id):
+    """Enable a scheduled task"""
+    try:
+        if crontab_manager.enable_scheduled_task(task_id):
+            click.echo(f"✅ Scheduled task {task_id} enabled")
+        else:
+            click.echo(f"❌ Scheduled task {task_id} not found")
+            sys.exit(1)
+            
+    except RuntimeError as e:
+        click.echo(f"❌ System error: {e}", err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(f"❌ Error enabling scheduled task: {e}", err=True)
+        sys.exit(1)
+
+
+@schedule.command()
+@click.argument('task_id')
+def disable(task_id):
+    """Disable a scheduled task"""
+    try:
+        if crontab_manager.disable_scheduled_task(task_id):
+            click.echo(f"✅ Scheduled task {task_id} disabled")
+        else:
+            click.echo(f"❌ Scheduled task {task_id} not found")
+            sys.exit(1)
+            
+    except RuntimeError as e:
+        click.echo(f"❌ System error: {e}", err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(f"❌ Error disabling scheduled task: {e}", err=True)
+        sys.exit(1)
 
 
 if __name__ == '__main__':
