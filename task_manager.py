@@ -8,7 +8,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 from uuid import uuid4
 
-from models import Task, TaskState, ProcessState, TaskType, AlertLevel
+from models import Task, TaskState, ProcessState, TaskType, TaskPriority, AlertLevel
 from database import db
 from config.config import config
 from utils import create_alert, get_system_metrics
@@ -50,6 +50,7 @@ class TaskManager:
                    command: str,
                    description: str = None,
                    task_type: TaskType = TaskType.LIGHTWEIGHT,
+                   priority: TaskPriority = TaskPriority.NORMAL,
                    working_dir: str = None,
                    environment: Dict[str, str] = None,
                    tags: List[str] = None) -> Task:
@@ -61,6 +62,7 @@ class TaskManager:
             description=description,
             command=command,
             task_type=task_type,
+            priority=priority,
             working_dir=working_dir,
             environment=environment or {},
             tags=tags or [],
@@ -96,11 +98,33 @@ class TaskManager:
             queue_file.unlink()
     
     def get_next_pending_task(self) -> Optional[Task]:
-        """Get next pending task using atomic file operations"""
+        """Get next pending task using atomic file operations with priority sorting"""
         pending_dir = config.queue_dir / "pending"
         
-        # Get all pending task files sorted by creation time
-        task_files = sorted(pending_dir.glob("*.json"), key=os.path.getctime)
+        # Get all pending task files and sort by priority then creation time
+        task_files = list(pending_dir.glob("*.json"))
+        
+        # Define priority order (higher priority values = earlier processing)
+        priority_order = {
+            TaskPriority.URGENT: 0,
+            TaskPriority.HIGH: 1,
+            TaskPriority.NORMAL: 2,
+            TaskPriority.LOW: 3
+        }
+        
+        # Sort by priority first, then by creation time
+        def sort_key(task_file):
+            try:
+                # Load task to get priority
+                with open(task_file, 'r', encoding='utf-8') as f:
+                    task_data = json.load(f)
+                priority = TaskPriority(task_data.get('priority', TaskPriority.NORMAL))
+                return (priority_order.get(priority, 2), os.path.getctime(task_file))
+            except Exception:
+                # Fallback to normal priority if task cannot be read
+                return (2, os.path.getctime(task_file))
+        
+        task_files = sorted(task_files, key=sort_key)
         
         for task_file in task_files:
             try:

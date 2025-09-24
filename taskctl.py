@@ -104,6 +104,7 @@ def create(name, description, task_type, priority, working_dir, env, tag, skip_s
             command=generated_command,
             description=description,
             task_type=TaskType(task_type),
+            priority=TaskPriority(priority),
             working_dir=working_dir,
             environment=environment,
             tags=tag_list

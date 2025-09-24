@@ -167,3 +167,4 @@ Thumbs.db
 tmp/
 temp/
 *.tmp
+queue/
