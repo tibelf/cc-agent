@@ -58,7 +58,12 @@ class CommandGenerator:
 IMPORTANT: This is an automated task execution. Do not ask for confirmation or user input. 
 If you have the necessary tools and permissions, execute the requested actions directly.
 If you cannot complete the action due to missing tools or authentication, 
-provide specific instructions for manual completion instead of asking for confirmation."""
+provide specific instructions for manual completion instead of asking for confirmation.
+
+COMPLETION RULE: 
+When ALL requested actions are successfully completed automatically, end your response with: "✅ TASK_COMPLETED"
+ONLY use this marker if the task is 100% completed without requiring any manual steps.
+DO NOT use this marker if you provide manual instructions, encounter errors, or cannot complete the task."""
 
         # 默认权限配置
         self.default_allowed_tools = [

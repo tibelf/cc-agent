@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
-from uuid import uuid4
+from uuid import uuid4, UUID
 
 from models import Task, TaskState, ProcessState, WorkerStatus, TaskType
 from task_manager import TaskManager
@@ -257,6 +257,85 @@ class ClaudeWorker:
 
         return resume_context
     
+    @staticmethod
+    def _is_uuid_format(value: Optional[str]) -> bool:
+        """Check whether the provided string is a valid UUID."""
+        if not value:
+            return False
+        try:
+            UUID(str(value))
+            return True
+        except (ValueError, TypeError, AttributeError):
+            return False
+
+    def _update_session_id(self, task: Task, candidate: str, source: str) -> bool:
+        """Update the stored session_id when a better candidate is found."""
+        if not candidate:
+            return False
+
+        candidate = candidate.strip()
+        if not candidate:
+            return False
+
+        current = task.checkpoint_data.get('session_id')
+        if current == candidate:
+            return False
+
+        candidate_is_uuid = self._is_uuid_format(candidate)
+        current_is_uuid = self._is_uuid_format(current) if current else False
+
+        # Always prefer UUID format over non-UUID format
+        # Do not downgrade an existing UUID to a non-UUID candidate
+        if current_is_uuid and not candidate_is_uuid:
+            logger.debug(
+                "Task %s: Ignoring non-UUID session_id %s from %s, keeping UUID %s",
+                task.id,
+                candidate,
+                source,
+                current,
+            )
+            return False
+
+        # Upgrade from non-UUID to UUID format
+        if current and not current_is_uuid and candidate_is_uuid:
+            logger.info(
+                "Task %s: Upgrading session_id from %s to UUID %s from %s",
+                task.id,
+                current,
+                candidate,
+                source,
+            )
+        # First session_id capture
+        elif not current:
+            logger.info(
+                "Task %s: Captured initial session_id from %s: %s (%s format)",
+                task.id,
+                source,
+                candidate,
+                "UUID" if candidate_is_uuid else "short"
+            )
+        # UUID to UUID replacement (should be rare)
+        elif current_is_uuid and candidate_is_uuid:
+            logger.info(
+                "Task %s: Replacing UUID session_id %s with %s from %s",
+                task.id,
+                current,
+                candidate,
+                source,
+            )
+        # Non-UUID to non-UUID replacement (when no UUID available)
+        else:
+            logger.info(
+                "Task %s: Updating session_id from %s to %s from %s",
+                task.id,
+                current,
+                candidate,
+                source,
+            )
+
+        task.checkpoint_data['session_id'] = candidate
+        return True
+
     def _extract_session_id(self, output_line: str, task: Task) -> bool:
         """Extract session_id from Claude output"""
         try:
@@ -265,9 +344,7 @@ class ClaudeWorker:
                 import json
                 data = json.loads(output_line)
                 if 'session_id' in data:
-                    task.checkpoint_data['session_id'] = data['session_id']
-                    logger.info(f"Task {task.id}: Captured session_id: {data['session_id']}")
-                    return True
+                    return self._update_session_id(task, data['session_id'], "line JSON")
         except json.JSONDecodeError:
             pass
         return False
@@ -334,9 +411,7 @@ class ClaudeWorker:
                 try:
                     data = json.loads(match)
                     if 'session_id' in data and data['session_id']:
-                        if 'session_id' not in task.checkpoint_data:
-                            task.checkpoint_data['session_id'] = data['session_id']
-                            logger.info(f"Task {task.id}: Captured session_id from chunk: {data['session_id']}")
+                        if self._update_session_id(task, data['session_id'], "chunk JSON"):
                             return True
                 except json.JSONDecodeError:
                     continue
@@ -354,17 +429,13 @@ class ClaudeWorker:
                                 json_array = json.loads(line)
                                 for item in json_array:
                                     if isinstance(item, dict) and 'session_id' in item:
-                                        if 'session_id' not in task.checkpoint_data:
-                                            task.checkpoint_data['session_id'] = item['session_id']
-                                            logger.info(f"Task {task.id}: Captured session_id from JSON array: {item['session_id']}")
+                                        if self._update_session_id(task, item['session_id'], "chunk array"):
                                             return True
                             else:
                                 # Try parsing as single JSON object
                                 data = json.loads(line)
                                 if 'session_id' in data:
-                                    if 'session_id' not in task.checkpoint_data:
-                                        task.checkpoint_data['session_id'] = data['session_id']
-                                        logger.info(f"Task {task.id}: Captured session_id from JSON object: {data['session_id']}")
+                                    if self._update_session_id(task, data['session_id'], "chunk object"):
                                         return True
                         except json.JSONDecodeError:
                             continue
@@ -428,10 +499,19 @@ class ClaudeWorker:
             pass
         return None
     
-    def _analyze_final_result(self, task: Task, total_output: str) -> bool:
-        """Analyze complete output for final result and determine if user interaction is needed"""
+    def _analyze_final_result(self, task: Task, total_output: str) -> tuple[bool, bool]:
+        """Analyze complete output for final result and determine if user interaction is needed
+        
+        Returns:
+            (interaction_needed: bool, task_completed: bool)
+        """
         try:
-            logger.info(f"Task {task.id}: Analyzing final result for interaction needs")
+            logger.info(f"Task {task.id}: Analyzing final result for completion and interaction needs")
+            
+            # First check for completion marker
+            if "✅ TASK_COMPLETED" in total_output:
+                logger.info(f"Task {task.id}: Found completion marker - task completed successfully")
+                return False, True  # No interaction needed, task is complete
             
             import json
             
@@ -453,6 +533,11 @@ class ClaudeWorker:
                                     logger.info(f"Task {task.id}: Extracted final result content ({len(result_content)} chars)")
                                     logger.info(f"Task {task.id}: Result preview: {result_content[:200]}...")
                                     
+                                    # Check for completion marker in result content
+                                    if "✅ TASK_COMPLETED" in result_content:
+                                        logger.info(f"Task {task.id}: Found completion marker in result content - task completed")
+                                        return False, True  # No interaction needed, task is complete
+                                    
                                     # Use AI to detect interaction need
                                     needs_interaction, auto_response = self._ai_detect_interaction_need_sync(result_content, task)
                                     if needs_interaction:
@@ -464,21 +549,23 @@ class ClaudeWorker:
                                             f"Final analysis: Interaction needed for result content",
                                             save_snapshot=True
                                         )
-                                        return True
+                                        return True, False
                                     else:
-                                        logger.info(f"Task {task.id}: Final result analysis - no interaction needed")
-                                        return False
+                                        logger.info(f"Task {task.id}: Final result analysis - no interaction needed but no completion marker found")
+                                        # If no completion marker and no interaction needed, task is incomplete
+                                        logger.warning(f"Task {task.id}: Task appears incomplete - no completion marker found")
+                                        return False, False
                                         
                     except json.JSONDecodeError as e:
                         logger.debug(f"Task {task.id}: JSON parse error for line: {e}")
                         continue
             
-            logger.info(f"Task {task.id}: No result JSON found in final output")
-            return False
+            logger.info(f"Task {task.id}: No result JSON found and no completion marker - task may be incomplete")
+            return False, False
             
         except Exception as e:
             logger.error(f"Task {task.id}: Error in final result analysis: {e}")
-            return False
+            return False, False
 
     def _ai_detect_interaction_need_sync(self, result_content: str, task: Task) -> tuple[bool, str]:
         """Use Claude CLI to detect if interaction is needed and generate autonomous response"""
@@ -760,14 +847,19 @@ Completed: {datetime.utcnow().isoformat()}
                     log_file.flush()
                 
                 if exit_code == 0:
-                    # Analyze final result for interaction needs before marking as completed
-                    interaction_needed = self._analyze_final_result(task, total_output)
+                    # Analyze final result for interaction needs and completion before marking as completed
+                    interaction_needed, task_completed = self._analyze_final_result(task, total_output)
                     if interaction_needed:
                         # Task needs user interaction, change state to retrying
                         return False
                     
-                    logger.info(f"Task {task.id} completed with exit code 0")
-                    return True
+                    if task_completed:
+                        logger.info(f"Task {task.id} completed with exit code 0 and completion marker")
+                        return True
+                    else:
+                        logger.error(f"Task {task.id} finished with exit code 0 but no completion marker - marking as failed")
+                        task.add_error("Process completed but no completion marker found - task may be incomplete")
+                        return False
                 else:
                     logger.error(f"Task {task.id} failed with exit code {exit_code}")
                     task.add_error(f"Process exited with code {exit_code}")
