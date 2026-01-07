@@ -35,7 +35,11 @@ def test_resume_context_not_detected():
         "Auto-responding with: yes",
         "Please continue with the task after this response.",
         "=== CHECKPOINT DATA ===",
-        "Continue from where we left off."
+        "Continue from where we left off.",
+        "=== COMPLETION REMINDER ===",
+        "Do not repeat actions that already succeeded.",
+        "When the task is fully complete, end your final response with the exact line: ✅ TASK_COMPLETED",
+        "Place the marker on its own line as the last content and do not add text after it."
     ]
     
     for line in resume_context_lines:

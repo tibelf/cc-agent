@@ -331,9 +331,16 @@ class TaskManager:
                 ""
             ])
         
-        # Final instructions
-        context_parts.append("Continue from where we left off.")
-        
+        # Final instructions and reminder about completion marker
+        context_parts.extend([
+            "Continue from where we left off.",
+            "",
+            "=== COMPLETION REMINDER ===",
+            "Do not repeat actions that already succeeded.",
+            "When the task is fully complete, end your final response with the exact line: ✅ TASK_COMPLETED",
+            "Place the marker on its own line as the last content and do not add text after it."
+        ])
+
         return "\n".join(context_parts)
     
     async def _monitor_system_health(self):
