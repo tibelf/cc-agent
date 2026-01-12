@@ -225,6 +225,7 @@ class ClaudeWorker:
                 env=env,
                 cwd=working_dir,
                 limit=1024*1024  # 1MB buffer for large JSON outputs
+                executable="/usr/bin/zsh"  # Use zsh for better quote handling
             )
             
             self.status.state = ProcessState.RUNNING
