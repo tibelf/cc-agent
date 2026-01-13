@@ -10,6 +10,28 @@ from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 from uuid import uuid4, UUID
 
+
+def load_env_file():
+    """Load environment variables from .env file"""
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        with open(env_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, _, value = line.partition('=')
+                    key = key.strip()
+                    value = value.strip()
+                    # Remove surrounding quotes if present
+                    if (value.startswith('"') and value.endswith('"')) or \
+                       (value.startswith("'") and value.endswith("'")):
+                        value = value[1:-1]
+                    os.environ.setdefault(key, value)
+
+
+# Load .env before other imports that might need environment variables
+load_env_file()
+
 from models import Task, TaskState, ProcessState, WorkerStatus, TaskType
 from task_manager import TaskManager
 from database import db
@@ -224,8 +246,7 @@ class ClaudeWorker:
                 stdin=asyncio.subprocess.DEVNULL,
                 env=env,
                 cwd=working_dir,
-                limit=1024*1024,  # 1MB buffer for large JSON outputs
-                executable="/usr/bin/zsh"  # Use zsh for better quote handling
+                limit=1024*1024  # 1MB buffer for large JSON outputs
             )
             
             self.status.state = ProcessState.RUNNING

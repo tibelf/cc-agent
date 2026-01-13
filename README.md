@@ -47,16 +47,32 @@ cd auto-claude
 pip install -r requirements.txt
 ```
 
-### 2. 初始化系统
+### 2. 配置环境变量
+创建 `.env` 文件配置 Claude API 凭据：
+```bash
+cp .env.example .env
+# 编辑 .env 文件，填入你的 API 凭据
+```
+
+`.env` 文件内容示例：
+```bash
+# Claude API 配置
+ANTHROPIC_AUTH_TOKEN=your_api_key_here
+ANTHROPIC_BASE_URL=https://api.anthropic.com  # 或自定义 API 端点
+```
+
+> **注意**: `.env` 文件包含敏感凭据，已被添加到 `.gitignore`，不会被提交到 Git 仓库。
+
+### 3. 初始化系统
 ```bash
 python taskctl.py init
 ```
 **作用**: 创建必要的目录结构、初始化数据库、配置日志系统
 
-### 3. 配置调整 (可选)
+### 4. 配置调整 (可选)
 编辑 `config/config.py` 文件以调整系统参数
 
-### 4. 启动系统
+### 5. 启动系统
 ```bash
 # 直接运行 (适用于开发和测试)
 python auto_claude.py
@@ -342,6 +358,12 @@ rate_limit_backoff_multiplier = 2.0
 # 解决: 确保Claude Code CLI已正确安装
 which claude
 claude --version
+
+# 错误: Your account does not have access to Claude Code / authentication_failed
+# 解决: 检查 .env 文件中的 API 凭据配置
+cat .env  # 确认 ANTHROPIC_AUTH_TOKEN 已正确设置
+# 注意: Worker 使用子进程调用 claude，不会加载 shell 函数或 .zshrc/.bashrc 中的配置
+# 必须在 .env 文件中配置环境变量
 
 # 错误: Permission denied
 # 解决: 检查文件权限和工作目录
