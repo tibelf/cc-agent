@@ -203,14 +203,22 @@ def list(state, priority, tag, limit, output_format):
 @task.command()
 @click.argument('task_id')
 @click.option('--show-logs', is_flag=True, help='Show task logs')
-def show(task_id, show_logs):
+@click.option('--format', 'output_format', type=click.Choice(['table', 'json']), default='table', help='Output format')
+def show(task_id, show_logs, output_format):
     """Show detailed task information"""
     try:
         task = db.get_task(task_id)
         if not task:
             click.echo(f"❌ Task not found: {task_id}")
             sys.exit(1)
-        
+
+        # JSON format output
+        if output_format == 'json':
+            task_dict = task.model_dump(mode='json')
+            click.echo(json.dumps(task_dict, indent=2, default=str, ensure_ascii=False))
+            return
+
+        # Table/text format output (default)
         # Basic info
         click.echo(f"Task ID: {task.id}")
         click.echo(f"Name: {task.name}")
@@ -220,7 +228,7 @@ def show(task_id, show_logs):
         click.echo(f"Priority: {task.priority.value}")
         click.echo(f"Type: {task.task_type.value}")
         click.echo(f"Created: {task.created_at}")
-        
+
         if task.started_at:
             click.echo(f"Started: {task.started_at}")
         if task.completed_at:
@@ -228,27 +236,27 @@ def show(task_id, show_logs):
             duration = (task.completed_at - task.started_at).total_seconds() if task.started_at else None
             if duration:
                 click.echo(f"Duration: {format_duration(int(duration))}")
-        
+
         if task.next_allowed_at:
             click.echo(f"Next allowed: {task.next_allowed_at}")
-        
+
         if task.retry_count > 0:
             click.echo(f"Retry count: {task.retry_count}/{task.max_retries}")
-        
+
         if task.assigned_worker:
             click.echo(f"Assigned worker: {task.assigned_worker}")
-        
+
         if task.tags:
             click.echo(f"Tags: {', '.join(task.tags)}")
-        
+
         if task.last_error:
             click.echo(f"Last error: {task.last_error}")
-        
+
         # Show logs if requested
         if show_logs:
             task_dir = config.tasks_dir / task.id
             output_file = task_dir / "output.log"
-            
+
             if output_file.exists():
                 click.echo("\n--- Task Output ---")
                 with open(output_file, 'r', encoding='utf-8') as f:
@@ -259,7 +267,7 @@ def show(task_id, show_logs):
                         click.echo(line)
             else:
                 click.echo("No logs available.")
-        
+
     except Exception as e:
         click.echo(f"❌ Error showing task: {e}", err=True)
         sys.exit(1)
